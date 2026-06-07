@@ -1,0 +1,896 @@
+#!/usr/bin/env bash
+
+set -u
+
+PROGRAM="agent-env"
+CONTRACT_REL=".agent-env/environment.conf"
+FORMAT_VERSION="1"
+DRY_RUN=false
+ADOPT=false
+ADVANCED=false
+FROM_FILE=""
+CHECK_ONLY=false
+STALE=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./agent-env init [DIR] [--advanced] [--from FILE] [--dry-run] [--adopt]
+  ./agent-env validate [DIR]
+  ./agent-env render [DIR] [--dry-run] [--adopt]
+  ./agent-env doctor [DIR]
+
+Commands:
+  init      Interview the user or read a contract, initialize Git, and render files.
+  validate  Validate the environment contract.
+  render    Regenerate managed files from the environment contract.
+  doctor    Validate the contract and report repository readiness.
+EOF
+}
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  exit 1
+}
+
+note() {
+  printf '%s\n' "$*"
+}
+
+is_true() {
+  [ "$1" = "true" ]
+}
+
+known_key() {
+  case "$1" in
+    AES_VERSION|PROJECT_NAME|PURPOSE|AUDIENCE|FIRST_MILESTONE|TECH_CONSTRAINTS|SETUP_COMMAND|TEST_COMMAND|LINT_COMMAND|ALLOWED_ACTIONS|RESTRICTED_PATHS|SUCCESS_CRITERIA|MODULE_POLICY|MODULE_EVALS|MODULE_CLAUDE)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+contract_value() {
+  key=$1
+  file=$2
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key="*)
+        printf '%s' "${line#*=}"
+        return 0
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+validate_contract() {
+  file=$1
+  [ -f "$file" ] || {
+    printf 'missing contract: %s\n' "$file" >&2
+    return 1
+  }
+  [ ! -L "$file" ] || {
+    printf 'contract must not be a symbolic link: %s\n' "$file" >&2
+    return 1
+  }
+
+  seen=""
+  line_number=0
+  errors=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    case "$line" in
+      ""|\#*)
+        continue
+        ;;
+      *$'\r'*)
+        printf '%s:%s: carriage returns are not supported\n' "$file" "$line_number" >&2
+        errors=$((errors + 1))
+        continue
+        ;;
+      *=*)
+        key=${line%%=*}
+        value=${line#*=}
+        ;;
+      *)
+        printf '%s:%s: expected KEY=value\n' "$file" "$line_number" >&2
+        errors=$((errors + 1))
+        continue
+        ;;
+    esac
+
+    case "$key" in
+      ""|*[!A-Z0-9_]*)
+        printf '%s:%s: invalid key: %s\n' "$file" "$line_number" "$key" >&2
+        errors=$((errors + 1))
+        continue
+        ;;
+    esac
+    if ! known_key "$key"; then
+      printf '%s:%s: unsupported key: %s\n' "$file" "$line_number" "$key" >&2
+      errors=$((errors + 1))
+    fi
+    case "
+$seen
+" in
+      *"
+$key
+"*)
+        printf '%s:%s: duplicate key: %s\n' "$file" "$line_number" "$key" >&2
+        errors=$((errors + 1))
+        ;;
+      *)
+        seen="${seen}${key}
+"
+        ;;
+    esac
+    case "$value" in
+      *"<!-- BEGIN AGENT-ENV"*|*"<!-- END AGENT-ENV"*)
+        printf '%s:%s: managed marker text is not allowed in values\n' "$file" "$line_number" >&2
+        errors=$((errors + 1))
+        ;;
+    esac
+  done < "$file"
+
+  for key in AES_VERSION PROJECT_NAME PURPOSE AUDIENCE FIRST_MILESTONE TECH_CONSTRAINTS SETUP_COMMAND TEST_COMMAND LINT_COMMAND ALLOWED_ACTIONS RESTRICTED_PATHS SUCCESS_CRITERIA MODULE_POLICY MODULE_EVALS MODULE_CLAUDE; do
+    value=$(contract_value "$key" "$file" 2>/dev/null || true)
+    if ! contract_value "$key" "$file" >/dev/null; then
+      printf '%s: missing required key: %s\n' "$file" "$key" >&2
+      errors=$((errors + 1))
+    elif [ -z "$value" ]; then
+      printf '%s: required value is empty: %s\n' "$file" "$key" >&2
+      errors=$((errors + 1))
+    fi
+  done
+
+  version=$(contract_value AES_VERSION "$file" 2>/dev/null || true)
+  [ "$version" = "$FORMAT_VERSION" ] || {
+    printf '%s: unsupported AES_VERSION: %s\n' "$file" "$version" >&2
+    errors=$((errors + 1))
+  }
+  for key in MODULE_POLICY MODULE_EVALS MODULE_CLAUDE; do
+    value=$(contract_value "$key" "$file" 2>/dev/null || true)
+    case "$value" in
+      true|false) ;;
+      *)
+        printf '%s: %s must be true or false\n' "$file" "$key" >&2
+        errors=$((errors + 1))
+        ;;
+    esac
+  done
+
+  [ "$errors" -eq 0 ]
+}
+
+assert_safe_target() {
+  root=$1
+  relative=$2
+  current=$root
+  old_ifs=$IFS
+  IFS='/'
+  set -- $relative
+  IFS=$old_ifs
+  for component in "$@"; do
+    current="$current/$component"
+    if [ -L "$current" ]; then
+      fail "refusing symbolic-link path: $current"
+    fi
+  done
+}
+
+ensure_parent() {
+  target=$1
+  parent=$(dirname "$target")
+  if is_true "$DRY_RUN" || is_true "$CHECK_ONLY"; then
+    return
+  fi
+  mkdir -p "$parent" || fail "cannot create directory: $parent"
+}
+
+marker_count() {
+  marker=$1
+  file=$2
+  awk -v marker="$marker" '$0 == marker { count++ } END { print count + 0 }' "$file"
+}
+
+preflight_managed() {
+  root=$1
+  relative=$2
+  label=$3
+  target="$root/$relative"
+  begin="<!-- BEGIN AGENT-ENV: $label -->"
+  end="<!-- END AGENT-ENV: $label -->"
+
+  assert_safe_target "$root" "$relative"
+  [ -e "$target" ] || return 0
+  [ -f "$target" ] || fail "managed target is not a regular file: $target"
+
+  begins=$(marker_count "$begin" "$target")
+  ends=$(marker_count "$end" "$target")
+  if [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; then
+    is_true "$ADOPT" || fail "existing file has no managed section: $target (rerun with --adopt)"
+    return
+  fi
+  [ "$begins" -eq 1 ] && [ "$ends" -eq 1 ] || fail "invalid managed markers in $target"
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin {
+      if (inside || found) exit 1
+      inside = 1
+      found = 1
+      next
+    }
+    $0 == end {
+      if (!inside) exit 1
+      inside = 0
+    }
+    END {
+      if (inside || !found) exit 1
+    }
+  ' "$target" >/dev/null || fail "invalid managed marker order in $target"
+}
+
+write_managed() {
+  root=$1
+  relative=$2
+  label=$3
+  content=$4
+  target="$root/$relative"
+  begin="<!-- BEGIN AGENT-ENV: $label -->"
+  end="<!-- END AGENT-ENV: $label -->"
+
+  assert_safe_target "$root" "$relative"
+  ensure_parent "$target"
+
+  if is_true "$DRY_RUN" || is_true "$CHECK_ONLY"; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  else
+    tmp=$(mktemp "$(dirname "$target")/.agent-env.tmp.XXXXXX") || fail "cannot create target temporary file"
+  fi
+  if [ -e "$target" ]; then
+    [ -f "$target" ] || {
+      rm -f "$tmp"
+      fail "managed target is not a regular file: $target"
+    }
+    begins=$(marker_count "$begin" "$target")
+    ends=$(marker_count "$end" "$target")
+    if [ "$begins" -eq 0 ] && [ "$ends" -eq 0 ]; then
+      if ! is_true "$ADOPT"; then
+        rm -f "$tmp"
+        fail "existing file has no managed section: $target (rerun with --adopt)"
+      fi
+      cat "$target" > "$tmp"
+      if [ -s "$target" ]; then
+        printf '\n' >> "$tmp"
+      fi
+      {
+        printf '%s\n' "$begin"
+        cat "$content"
+        printf '%s\n' "$end"
+      } >> "$tmp"
+    elif [ "$begins" -ne 1 ] || [ "$ends" -ne 1 ]; then
+      rm -f "$tmp"
+      fail "invalid managed markers in $target"
+    else
+      awk -v begin="$begin" -v end="$end" -v content="$content" '
+        $0 == begin {
+          if (inside || replaced) exit 42
+          print
+          while ((getline line < content) > 0) print line
+          close(content)
+          inside = 1
+          replaced = 1
+          next
+        }
+        $0 == end {
+          if (!inside) exit 43
+          inside = 0
+          print
+          next
+        }
+        !inside { print }
+        END {
+          if (inside || !replaced) exit 44
+        }
+      ' "$target" > "$tmp" || {
+        rm -f "$tmp"
+        fail "invalid managed marker order in $target"
+      }
+    fi
+  else
+    {
+      printf '%s\n' "$begin"
+      cat "$content"
+      printf '%s\n' "$end"
+    } > "$tmp"
+  fi
+
+  if [ -e "$target" ] && cmp -s "$target" "$tmp"; then
+    if is_true "$CHECK_ONLY"; then
+      note "PASS $relative is current"
+    else
+      note "unchanged $relative"
+    fi
+    rm -f "$tmp"
+    return
+  fi
+  if is_true "$CHECK_ONLY"; then
+    note "FAIL $relative is stale or missing"
+    STALE=$((STALE + 1))
+    rm -f "$tmp"
+    return
+  fi
+  if is_true "$DRY_RUN"; then
+    note "would update $relative"
+    rm -f "$tmp"
+    return
+  fi
+  chmod --reference="$target" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+  mv "$tmp" "$target" || {
+    rm -f "$tmp"
+    fail "cannot update $target"
+  }
+  note "updated $relative"
+}
+
+write_contract() {
+  root=$1
+  source=$2
+  target="$root/$CONTRACT_REL"
+  assert_safe_target "$root" "$CONTRACT_REL"
+  ensure_parent "$target"
+  if is_true "$DRY_RUN"; then
+    note "would write $CONTRACT_REL"
+    return
+  fi
+  tmp=$(mktemp "$(dirname "$target")/.agent-env.tmp.XXXXXX") || fail "cannot create target temporary file"
+  cat "$source" > "$tmp" || fail "cannot read contract source"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$target" || fail "cannot write contract"
+  note "wrote $CONTRACT_REL"
+}
+
+prompt_value() {
+  prompt=$1
+  default=$2
+  printf '%s [%s]: ' "$prompt" "$default" >&2
+  IFS= read -r answer || answer=""
+  if [ -z "$answer" ]; then
+    answer=$default
+  fi
+  case "$answer" in
+    *$'\n'*|*$'\r'*) fail "answers must be one line" ;;
+  esac
+  printf '%s' "$answer"
+}
+
+prompt_bool() {
+  prompt=$1
+  default=$2
+  if [ "$default" = "true" ]; then
+    hint="Y/n"
+  else
+    hint="y/N"
+  fi
+  printf '%s [%s]: ' "$prompt" "$hint" >&2
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES|Yes) printf 'true' ;;
+    n|N|no|NO|No) printf 'false' ;;
+    "") printf '%s' "$default" ;;
+    *) fail "expected yes or no" ;;
+  esac
+}
+
+create_interview_contract() {
+  output=$1
+  name=$(prompt_value "Project name" "$(basename "$TARGET")")
+  purpose=$(prompt_value "Project purpose" "Describe the problem this project solves")
+  audience=$(prompt_value "Primary audience" "Project users and maintainers")
+  milestone=$(prompt_value "First milestone" "Deliver the smallest working vertical slice")
+  setup=$(prompt_value "Setup command" "unknown")
+  tests=$(prompt_value "Test command" "unknown")
+  lint=$(prompt_value "Lint command" "unknown")
+  success=$(prompt_value "Definition of done" "Requested behavior works and relevant checks pass")
+
+  constraints="None documented"
+  allowed="Read project files; edit files required by the task; run documented checks"
+  restricted="Secrets; production credentials; generated or vendor files unless requested"
+  module_policy=false
+  module_evals=false
+  module_claude=false
+  if is_true "$ADVANCED"; then
+    constraints=$(prompt_value "Technology constraints" "$constraints")
+    allowed=$(prompt_value "Allowed actions" "$allowed")
+    restricted=$(prompt_value "Restricted paths or resources" "$restricted")
+    module_policy=$(prompt_bool "Generate the agent policy?" true)
+    module_evals=$(prompt_bool "Generate acceptance evaluations?" true)
+    module_claude=$(prompt_bool "Generate CLAUDE.md adapter?" false)
+  fi
+
+  cat > "$output" <<EOF
+# Agent Environment Specification. Values are literal single-line text.
+AES_VERSION=$FORMAT_VERSION
+PROJECT_NAME=$name
+PURPOSE=$purpose
+AUDIENCE=$audience
+FIRST_MILESTONE=$milestone
+TECH_CONSTRAINTS=$constraints
+SETUP_COMMAND=$setup
+TEST_COMMAND=$tests
+LINT_COMMAND=$lint
+ALLOWED_ACTIONS=$allowed
+RESTRICTED_PATHS=$restricted
+SUCCESS_CRITERIA=$success
+MODULE_POLICY=$module_policy
+MODULE_EVALS=$module_evals
+MODULE_CLAUDE=$module_claude
+EOF
+}
+
+load_values() {
+  contract=$1
+  PROJECT_NAME=$(contract_value PROJECT_NAME "$contract")
+  PURPOSE=$(contract_value PURPOSE "$contract")
+  AUDIENCE=$(contract_value AUDIENCE "$contract")
+  FIRST_MILESTONE=$(contract_value FIRST_MILESTONE "$contract")
+  TECH_CONSTRAINTS=$(contract_value TECH_CONSTRAINTS "$contract")
+  SETUP_COMMAND=$(contract_value SETUP_COMMAND "$contract")
+  TEST_COMMAND=$(contract_value TEST_COMMAND "$contract")
+  LINT_COMMAND=$(contract_value LINT_COMMAND "$contract")
+  ALLOWED_ACTIONS=$(contract_value ALLOWED_ACTIONS "$contract")
+  RESTRICTED_PATHS=$(contract_value RESTRICTED_PATHS "$contract")
+  SUCCESS_CRITERIA=$(contract_value SUCCESS_CRITERIA "$contract")
+  MODULE_POLICY=$(contract_value MODULE_POLICY "$contract")
+  MODULE_EVALS=$(contract_value MODULE_EVALS "$contract")
+  MODULE_CLAUDE=$(contract_value MODULE_CLAUDE "$contract")
+}
+
+render_agents() {
+  root=$1
+  content=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  cat > "$content" <<EOF
+# $PROJECT_NAME Agent Instructions
+
+## Project Context
+
+- **Purpose:** $PURPOSE
+- **Audience:** $AUDIENCE
+- **First milestone:** $FIRST_MILESTONE
+- **Technology constraints:** $TECH_CONSTRAINTS
+
+## Commands
+
+- **Setup:** \`$SETUP_COMMAND\`
+- **Tests:** \`$TEST_COMMAND\`
+- **Lint:** \`$LINT_COMMAND\`
+
+Treat \`unknown\` as a request to inspect the repository, establish the appropriate command, and update the environment contract.
+
+## Boundaries
+
+- **Allowed actions:** $ALLOWED_ACTIONS
+- **Restricted paths or resources:** $RESTRICTED_PATHS
+- **Definition of done:** $SUCCESS_CRITERIA
+
+## Agent Behavior
+
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+
+### 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them; don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+### 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No flexibility or configurability that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+### 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+
+- Don't improve adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it; don't delete it.
+
+When your changes create orphans:
+
+- Remove imports, variables, and functions that your changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+Every changed line should trace directly to the user's request.
+
+### 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+
+- "Add validation" becomes "Write tests for invalid inputs, then make them pass."
+- "Fix the bug" becomes "Write a test that reproduces it, then make it pass."
+- "Refactor X" becomes "Ensure tests pass before and after."
+
+For multi-step tasks, state a brief plan:
+
+\`\`\`text
+1. [Step] -> verify: [check]
+2. [Step] -> verify: [check]
+3. [Step] -> verify: [check]
+\`\`\`
+
+Strong success criteria let you loop independently. Weak criteria such as "make it work" require clarification.
+
+Project-specific instructions may supplement these guidelines but must not silently weaken them. These are behavioral instructions, not sandbox enforcement.
+EOF
+  write_managed "$root" "AGENTS.md" "AGENTS" "$content"
+  rm -f "$content"
+}
+
+render_brief() {
+  root=$1
+  content=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  cat > "$content" <<EOF
+# $PROJECT_NAME Project Brief
+
+## Problem
+
+$PURPOSE
+
+## Audience
+
+$AUDIENCE
+
+## First Milestone
+
+$FIRST_MILESTONE
+
+## Constraints
+
+$TECH_CONSTRAINTS
+
+## Acceptance
+
+$SUCCESS_CRITERIA
+EOF
+  write_managed "$root" "docs/PROJECT_BRIEF.md" "PROJECT-BRIEF" "$content"
+  rm -f "$content"
+}
+
+render_handoff() {
+  root=$1
+  content=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  cat > "$content" <<EOF
+# Coding Agent Handoff
+
+Read \`AGENTS.md\`, \`docs/PROJECT_BRIEF.md\`, and \`.agent-env/environment.conf\` before changing files.
+
+Build the first milestone for **$PROJECT_NAME**:
+
+> $FIRST_MILESTONE
+
+Start by inspecting the repository. State assumptions and a brief verifiable plan. Use the minimum implementation that satisfies:
+
+> $SUCCESS_CRITERIA
+
+Run the documented checks. If a command is \`unknown\`, establish the stack-appropriate command and update both the contract and managed instructions.
+EOF
+  write_managed "$root" ".agent-env/HANDOFF.md" "HANDOFF" "$content"
+  rm -f "$content"
+}
+
+render_gitignore() {
+  root=$1
+  content=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  cat > "$content" <<'EOF'
+# Local secrets and agent runtime state
+.env
+.env.*
+!.env.example
+.agent-env/local/
+EOF
+  write_managed "$root" ".gitignore" "GITIGNORE" "$content"
+  rm -f "$content"
+}
+
+render_policy() {
+  root=$1
+  content=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  cat > "$content" <<EOF
+# Agent Policy
+
+## Allowed
+
+$ALLOWED_ACTIONS
+
+## Restricted
+
+$RESTRICTED_PATHS
+
+## Required Evidence
+
+- Summarize changed files.
+- Report checks run and their results.
+- State any checks that could not be run.
+
+This document guides agent behavior. It does not enforce operating-system permissions or provide a security sandbox.
+EOF
+  write_managed "$root" "contracts/AGENT_POLICY.md" "POLICY" "$content"
+  rm -f "$content"
+}
+
+render_evals() {
+  root=$1
+  content=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  cat > "$content" <<EOF
+# Acceptance Evaluations
+
+## Baseline Scenario
+
+- **Given:** A clean checkout with documented prerequisites.
+- **When:** The first milestone is implemented and the documented checks run.
+- **Then:** $SUCCESS_CRITERIA
+
+## Evaluation Template
+
+- **Scenario:**
+- **Input:**
+- **Expected result:**
+- **Verification command:**
+- **Observed result:**
+- **Pass or fail:**
+EOF
+  write_managed "$root" "evals/acceptance.md" "EVALS" "$content"
+  rm -f "$content"
+}
+
+render_claude() {
+  root=$1
+  content=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+  cat > "$content" <<'EOF'
+@AGENTS.md
+
+Read and follow the shared repository instructions in `AGENTS.md`.
+EOF
+  write_managed "$root" "CLAUDE.md" "CLAUDE-ADAPTER" "$content"
+  rm -f "$content"
+}
+
+render_all() {
+  root=$1
+  contract="$root/$CONTRACT_REL"
+  validate_contract "$contract" || fail "contract validation failed"
+  load_values "$contract"
+  render_loaded "$root"
+}
+
+render_loaded() {
+  root=$1
+  preflight_all "$root"
+  render_agents "$root"
+  render_brief "$root"
+  render_handoff "$root"
+  render_gitignore "$root"
+  if is_true "$MODULE_POLICY"; then render_policy "$root"; fi
+  if is_true "$MODULE_EVALS"; then render_evals "$root"; fi
+  if is_true "$MODULE_CLAUDE"; then render_claude "$root"; fi
+}
+
+preflight_all() {
+  root=$1
+  preflight_managed "$root" "AGENTS.md" "AGENTS"
+  preflight_managed "$root" "docs/PROJECT_BRIEF.md" "PROJECT-BRIEF"
+  preflight_managed "$root" ".agent-env/HANDOFF.md" "HANDOFF"
+  preflight_managed "$root" ".gitignore" "GITIGNORE"
+  if is_true "$MODULE_POLICY"; then
+    preflight_managed "$root" "contracts/AGENT_POLICY.md" "POLICY"
+  fi
+  if is_true "$MODULE_EVALS"; then
+    preflight_managed "$root" "evals/acceptance.md" "EVALS"
+  fi
+  if is_true "$MODULE_CLAUDE"; then
+    preflight_managed "$root" "CLAUDE.md" "CLAUDE-ADAPTER"
+  fi
+}
+
+init_git() {
+  root=$1
+  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    note "Git repository already present"
+    return
+  fi
+  if is_true "$DRY_RUN"; then
+    note "would initialize Git with branch main"
+    return
+  fi
+  if git -C "$root" init -b main >/dev/null 2>&1; then
+    note "initialized Git with branch main"
+  else
+    git -C "$root" init >/dev/null || fail "Git initialization failed"
+    git -C "$root" symbolic-ref HEAD refs/heads/main || fail "cannot set initial branch"
+    note "initialized Git with branch main"
+  fi
+}
+
+doctor() {
+  root=$1
+  contract="$root/$CONTRACT_REL"
+  failures=0
+  warnings=0
+  if validate_contract "$contract"; then
+    note "PASS contract is valid"
+    load_values "$contract"
+  else
+    note "FAIL contract is invalid"
+    return 1
+  fi
+
+  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    note "PASS Git repository detected"
+  else
+    note "FAIL Git repository not detected"
+    failures=$((failures + 1))
+  fi
+
+  CHECK_ONLY=true
+  STALE=0
+  preflight_all "$root"
+  render_agents "$root"
+  render_brief "$root"
+  render_handoff "$root"
+  render_gitignore "$root"
+  if is_true "$MODULE_POLICY"; then render_policy "$root"; fi
+  if is_true "$MODULE_EVALS"; then render_evals "$root"; fi
+  if is_true "$MODULE_CLAUDE"; then render_claude "$root"; fi
+  CHECK_ONLY=false
+  failures=$((failures + STALE))
+
+  for pair in "Setup:$SETUP_COMMAND" "Tests:$TEST_COMMAND" "Lint:$LINT_COMMAND"; do
+    label=${pair%%:*}
+    command=${pair#*:}
+    if [ "$command" = "unknown" ]; then
+      note "WARN $label command is unknown"
+      warnings=$((warnings + 1))
+    fi
+  done
+
+  if ! is_true "$MODULE_POLICY" && [ -f "$root/contracts/AGENT_POLICY.md" ]; then
+    note "WARN policy module is disabled but contracts/AGENT_POLICY.md remains"
+    warnings=$((warnings + 1))
+  fi
+  if ! is_true "$MODULE_EVALS" && [ -f "$root/evals/acceptance.md" ]; then
+    note "WARN evals module is disabled but evals/acceptance.md remains"
+    warnings=$((warnings + 1))
+  fi
+  if ! is_true "$MODULE_CLAUDE" && [ -f "$root/CLAUDE.md" ]; then
+    note "WARN Claude module is disabled but CLAUDE.md remains"
+    warnings=$((warnings + 1))
+  fi
+
+  note "Doctor completed: $failures failure(s), $warnings warning(s)"
+  [ "$failures" -eq 0 ]
+}
+
+parse_options() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --advanced) ADVANCED=true ;;
+      --dry-run) DRY_RUN=true ;;
+      --adopt) ADOPT=true ;;
+      --from)
+        shift
+        [ "$#" -gt 0 ] || fail "--from requires a file"
+        FROM_FILE=$1
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      -*)
+        fail "unknown option: $1"
+        ;;
+      *)
+        [ -z "${TARGET_ARG:-}" ] || fail "only one target directory is allowed"
+        TARGET_ARG=$1
+        ;;
+    esac
+    shift
+  done
+}
+
+main() {
+  [ "$#" -gt 0 ] || {
+    usage
+    exit 1
+  }
+  command=$1
+  shift
+  TARGET_ARG=""
+  parse_options "$@"
+  TARGET=${TARGET_ARG:-.}
+
+  case "$command" in
+    init)
+      dry_target=""
+      if [ ! -d "$TARGET" ]; then
+        if is_true "$DRY_RUN"; then
+          note "would create directory $TARGET"
+          dry_target=$(mktemp -d "${TMPDIR:-/tmp}/agent-env-dry-run.XXXXXX") || fail "cannot create temporary directory"
+          TARGET=$dry_target
+        else
+          mkdir -p "$TARGET" || fail "cannot create target directory"
+        fi
+      fi
+      TARGET=$(cd "$TARGET" 2>/dev/null && pwd -P) || fail "cannot resolve target directory"
+      source_contract=$(mktemp "${TMPDIR:-/tmp}/agent-env.XXXXXX") || fail "cannot create temporary file"
+      if [ -n "$FROM_FILE" ]; then
+        [ -f "$FROM_FILE" ] || fail "contract source does not exist: $FROM_FILE"
+        cat "$FROM_FILE" > "$source_contract"
+      else
+        [ -t 0 ] || fail "interactive init requires a terminal or --from FILE"
+        create_interview_contract "$source_contract"
+      fi
+      validate_contract "$source_contract" || {
+        rm -f "$source_contract"
+        fail "source contract validation failed"
+      }
+      load_values "$source_contract"
+      assert_safe_target "$TARGET" "$CONTRACT_REL"
+      preflight_all "$TARGET"
+      init_git "$TARGET"
+      write_contract "$TARGET" "$source_contract"
+      rm -f "$source_contract"
+      if is_true "$DRY_RUN"; then
+        render_loaded "$TARGET"
+        if [ -n "$dry_target" ]; then
+          rm -rf "$dry_target"
+        fi
+        note "dry-run complete; no target files were changed"
+      else
+        render_all "$TARGET"
+      fi
+      ;;
+    validate)
+      TARGET=$(cd "$TARGET" 2>/dev/null && pwd -P) || fail "cannot resolve target directory"
+      validate_contract "$TARGET/$CONTRACT_REL" || fail "contract validation failed"
+      note "contract is valid"
+      ;;
+    render)
+      [ -z "$FROM_FILE" ] || fail "--from is only supported by init"
+      TARGET=$(cd "$TARGET" 2>/dev/null && pwd -P) || fail "cannot resolve target directory"
+      render_all "$TARGET"
+      ;;
+    doctor)
+      TARGET=$(cd "$TARGET" 2>/dev/null && pwd -P) || fail "cannot resolve target directory"
+      doctor "$TARGET"
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    *)
+      usage >&2
+      fail "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

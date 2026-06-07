@@ -1,0 +1,7 @@
+<!-- BEGIN AGENT-ENV: GITIGNORE -->
+# Local secrets and agent runtime state
+.env
+.env.*
+!.env.example
+.agent-env/local/
+<!-- END AGENT-ENV: GITIGNORE -->
